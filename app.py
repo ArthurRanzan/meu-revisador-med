@@ -25,22 +25,30 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- CONEXÃO DIRETA COM GSPREAD ---
+# --- CONEXÃO DIRETA COM GSPREAD (COM CORREÇÃO DE CHAVE) ---
 @st.cache_resource
 def get_gspread_client():
     try:
-        # Puxa o JSON direto do segredo service_account
-        info = json.loads(st.secrets["connections"]["gsheets"]["service_account"])
+        # Puxa o JSON do segredo service_account
+        info_str = st.secrets["connections"]["gsheets"]["service_account"]
+        info = json.loads(info_str)
+        
+        # CORREÇÃO CRÍTICA PARA REFRESHERROR:
+        # Garante que as quebras de linha na chave privada sejam reais e não texto "\n"
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+            
         client = gspread.service_account_from_dict(info)
         return client
     except Exception as e:
-        st.error(f"Erro na chave JSON: {e}")
+        st.error(f"Erro na autenticação: {e}")
+        st.info("💡 Verifique se colou o JSON completo (incluindo as chaves { }) entre aspas triplas no Secrets.")
         return None
 
 def get_sheet():
     client = get_gspread_client()
     if client:
-        # Abre pelo ID que é mais seguro
+        # Abre pelo ID que é o método mais infalível
         return client.open_by_key("1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8")
     return None
 
@@ -48,10 +56,12 @@ def load_data():
     sheet = get_sheet()
     if not sheet: return pd.DataFrame(), pd.DataFrame()
     try:
+        # get_all_records() é o método mais estável para transformar em DataFrame
         df_studies = pd.DataFrame(sheet.worksheet("estudos").get_all_records())
         df_adj = pd.DataFrame(sheet.worksheet("ajustes").get_all_records())
         return df_studies, df_adj
     except Exception:
+        # Fallback se as abas estiverem vazias
         return pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), \
                pd.DataFrame(columns=['id', 'date'])
 
@@ -59,28 +69,38 @@ def load_data():
 def save_session(new_row):
     sheet = get_sheet()
     if sheet:
-        ws = sheet.worksheet("estudos")
-        # Transforma o dicionário em uma lista na ordem certa
-        row_list = [new_row['data'], new_row['materia'], new_row['assunto'], 
-                    new_row['total'], new_row['acertos'], new_row['timestamp'], new_row['erros']]
-        ws.append_row(row_list)
-        return True
+        try:
+            ws = sheet.worksheet("estudos")
+            row_list = [
+                str(new_row['data']), 
+                str(new_row['materia']), 
+                str(new_row['assunto']), 
+                int(new_row['total']), 
+                int(new_row['acertos']), 
+                str(new_row['timestamp']), 
+                str(new_row['erros'])
+            ]
+            ws.append_row(row_list)
+            return True
+        except Exception as e:
+            st.error(f"Erro ao gravar sessão: {e}")
     return False
 
 def save_override(key, date_str):
     sheet = get_sheet()
     if sheet:
-        ws = sheet.worksheet("ajustes")
-        # Verifica se já existe e atualiza ou adiciona
-        data = ws.get_all_records()
-        df = pd.DataFrame(data)
-        if not df.empty and key in df['id'].values:
-            # Encontra a linha (gspread começa em 1, cabeçalho é 1, então +2)
-            idx = df[df['id'] == key].index[0] + 2
-            ws.update_cell(idx, 2, date_str)
-        else:
-            ws.append_row([key, date_str])
-        return True
+        try:
+            ws = sheet.worksheet("ajustes")
+            data = ws.get_all_records()
+            df = pd.DataFrame(data)
+            if not df.empty and key in df['id'].values:
+                idx = df[df['id'] == key].index[0] + 2
+                ws.update_cell(idx, 2, date_str)
+            else:
+                ws.append_row([key, date_str])
+            return True
+        except Exception as e:
+            st.error(f"Erro ao ajustar data: {e}")
     return False
 
 # Inicializar dados
@@ -91,9 +111,12 @@ def calculate_projections(sessions_df, overrides_df):
     if sessions_df.empty: return pd.DataFrame()
     projections = []
     
-    # Prepara dados
+    # Prepara dados (conversão para garantir que cálculos funcionem)
     temp_df = sessions_df.copy()
     temp_df['timestamp'] = pd.to_numeric(temp_df['timestamp'], errors='coerce')
+    temp_df['acertos'] = pd.to_numeric(temp_df['acertos'], errors='coerce').fillna(0)
+    temp_df['total'] = pd.to_numeric(temp_df['total'], errors='coerce').fillna(1)
+    
     valid_sessions = temp_df.dropna(subset=['timestamp'])
     if valid_sessions.empty: return pd.DataFrame()
 
@@ -105,22 +128,22 @@ def calculate_projections(sessions_df, overrides_df):
         initial = group.iloc[0]
         num = len(group)
         
-        try:
-            acc = (float(latest['acertos']) / float(latest['total'] if float(latest['total']) > 0 else 1)) * 100
-            initial_acc = (float(initial['acertos']) / (float(initial['total']) if float(initial['total']) > 0 else 1)) * 100
-        except: acc, initial_acc = 0, 0
+        acc = (float(latest['acertos']) / float(latest['total'] if float(latest['total']) > 0 else 1)) * 100
+        initial_acc = (float(initial['acertos']) / (float(initial['total']) if float(initial['total']) > 0 else 1)) * 100
             
-        try: last_dt = datetime.strptime(str(latest['data']), '%Y-%m-%d').date()
-        except: last_dt = datetime.now().date()
+        try: 
+            last_dt = datetime.strptime(str(latest['data']), '%Y-%m-%d').date()
+        except: 
+            last_dt = datetime.now().date()
             
         days, action, case_type = 1, "", ""
         
         if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Reiniciar Caso A.", "Caso A"
         elif initial_acc < 70:
-            if num == 1: days, action, case_type = 1, "D+1: Refazer erros.", "Caso A"
+            if num == 1: days, action, case_type = 1, "D+1: Refazer erros (Foco 100%).", "Caso A"
             elif num == 2:
                 if acc >= 100: days, action, case_type = 3, "D+4: Estabilidade.", "Caso A"
-                else: days, action, case_type = 1, "⚠️ Repetir D+1.", "Caso A"
+                else: days, action, case_type = 1, "⚠️ Repetir D+1: Precisa de 100%.", "Caso A"
             else:
                 if acc > 85: days, action, case_type = 15, "✅ Promovido.", "Caso C"
                 else: days, action, case_type = 7, "❌ Reforço.", "Caso B"
@@ -166,10 +189,10 @@ with tabs[0]: # AGENDA
                             st.success("Data alterada!"); st.rerun()
                     if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                         st.session_state.prefill = row; st.success("Copiado!")
-    else: st.write("Nada pendente.")
+    else: st.write("Nada pendente. Comece registrando um estudo na aba ao lado!")
 
 with tabs[1]: # REGISTRAR
-    st.subheader("Novo Registro")
+    st.subheader("Novo Registro de Estudo")
     pre = st.session_state.get('prefill', None)
     with st.form("f_reg", clear_on_submit=True):
         c1, c2 = st.columns(2)
@@ -180,7 +203,7 @@ with tabs[1]: # REGISTRAR
         c3, c4 = st.columns(2)
         with c3: t_in = st.number_input("Total Questões", min_value=1, value=20)
         with c4: ac_in = st.number_input("Acertos", min_value=0, value=0)
-        err_in = st.text_area("Questões Erradas (IDs)")
+        err_in = st.text_area("IDs das Questões Erradas", help="Ex: Q02, Q10")
         if st.form_submit_button("Salvar Registro"):
             new_r = {
                 'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 
@@ -197,8 +220,9 @@ with tabs[2]: # DESEMPENHO
         df_calc['acertos'] = pd.to_numeric(df_calc['acertos'], errors='coerce').fillna(0)
         df_calc['nota'] = (df_calc['acertos'] / df_calc['total']) * 100
         st.metric("Aproveitamento Geral", f"{df_calc['nota'].mean():.1f}%")
-        st.bar_chart(df_calc.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0))
-    else: st.info("Sem dados.")
+        subj_p = df_calc.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0).reset_index()
+        st.bar_chart(subj_p.set_index('materia'))
+    else: st.info("Sem dados suficientes para gerar gráficos.")
 
 with tabs[3]: # HISTÓRICO
     if not df_sessions.empty:
