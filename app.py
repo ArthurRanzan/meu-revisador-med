@@ -31,11 +31,12 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- CONEXÃO COM GOOGLE SHEETS ---
+# Inicializamos a conexão. O Streamlit Cloud lerá os Secrets automaticamente.
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
+    """Carrega os dados das abas 'estudos' e 'ajustes'."""
     try:
-        # Carrega dados das abas com tratamento de erro e remove linhas vazias
         df_studies = conn.read(worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
         
@@ -44,24 +45,37 @@ def load_all_data():
         
         return df_studies, df_adj
     except Exception:
+        # Se as abas não existirem ainda, retorna estruturas limpas
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
+    """Salva os dados de forma robusta para evitar UnsupportedOperationError."""
     try:
-        # Normalização total: transformamos tudo em texto/número limpo
-        df_studies = df_studies.astype(str).replace("nan", "")
-        df_adj = df_adj.astype(str).replace("nan", "")
+        # 1. Limpeza Profunda: Transforma tudo em String ou Inteiro simples. 
+        # O Google Sheets às vezes rejeita objetos complexos do Pandas.
+        df_studies_clean = df_studies.copy()
+        df_studies_clean = df_studies_clean.fillna("")
+        df_studies_clean['total'] = pd.to_numeric(df_studies_clean['total'], errors='coerce').fillna(0).astype(int)
+        df_studies_clean['acertos'] = pd.to_numeric(df_studies_clean['acertos'], errors='coerce').fillna(0).astype(int)
+        df_studies_clean['timestamp'] = pd.to_numeric(df_studies_clean['timestamp'], errors='coerce').fillna(0).astype(str)
+        
+        df_adj_clean = df_adj.copy()
+        df_adj_clean = df_adj_clean.fillna("").astype(str)
 
-        # Gravação nas abas específicas
-        conn.update(worksheet="estudos", data=df_studies)
-        conn.update(worksheet="ajustes", data=df_adj)
+        # 2. Gravação: O parâmetro 'worksheet' deve bater exatamente com o nome na planilha.
+        conn.update(worksheet="estudos", data=df_studies_clean)
+        conn.update(worksheet="ajustes", data=df_adj_clean)
         
         st.cache_data.clear()
         return True
     except Exception as e:
-        st.error(f"Erro ao salvar na planilha: {str(e)}")
-        st.info("💡 Lembrete: Verifique se as abas se chamam exatamente 'estudos' e 'ajustes'.")
+        error_msg = str(e)
+        if "cannot be written to" in error_msg:
+            st.error("ERRO DE AUTENTICAÇÃO: A planilha está em modo 'Apenas Leitura'.")
+            st.info("💡 Verifique se o campo 'Secrets' no Streamlit Cloud tem o cabeçalho [connections.gsheets] e as aspas triplas.")
+        else:
+            st.error(f"Erro ao salvar na planilha: {error_msg}")
         return False
 
 # Carregamento inicial
@@ -72,17 +86,15 @@ def calculate_projections(sessions_df, overrides_df):
     projections = []
     if sessions_df.empty: return pd.DataFrame()
     
-    # Processa os dados numéricos para o cálculo
+    # Prepara os dados numéricos para o cálculo de ciclo
     temp_df = sessions_df.copy()
     temp_df['timestamp'] = pd.to_numeric(temp_df['timestamp'], errors='coerce')
     valid_sessions = temp_df.dropna(subset=['timestamp'])
     
     if valid_sessions.empty: return pd.DataFrame()
 
-    # Agrupa por Assunto e ordena por tempo (Sliding Window)
     groups = valid_sessions.sort_values('timestamp').groupby(['materia', 'assunto'])
     
-    # Prepara dicionário de ajustes manuais
     overrides_dict = {}
     if not overrides_df.empty:
         overrides_dict = pd.Series(overrides_df.date.values, index=overrides_df.id).to_dict()
@@ -142,9 +154,8 @@ def calculate_projections(sessions_df, overrides_df):
 # --- INTERFACE ---
 st.title("📝 REVISADOR")
 
-# Alerta de conexão
 if df_sessions.empty:
-    st.info("Aguardando seu primeiro registro de estudo ou carregando planilha...")
+    st.info("Aguardando seu primeiro registro ou carregando planilha...")
 
 tabs = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
@@ -161,7 +172,7 @@ with tabs[0]: # AGENDA
             with st.expander(f"{row['Data']} | {row['Materia']} - {row['Assunto']}"):
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.markdown(f"**Fase:** {row['Caso']} | **Sessão:** #{row['Passo']}")
+                    st.markdown(f"**Status:** {row['Caso']} | **Sessão:** #{row['Passo']}")
                     st.info(f"👉 {row['Ação']}")
                     if str(row['Erros']) != "" and str(row['Erros']) != "nan":
                         st.error(f"⚠️ Refazer erros: {row['Erros']}")
@@ -171,7 +182,8 @@ with tabs[0]: # AGENDA
                         new_o = pd.DataFrame([{'id': row['Key'], 'date': new_d.strftime('%Y-%m-%d')}])
                         df_overrides = df_overrides[df_overrides.id != row['Key']] if not df_overrides.empty else df_overrides
                         df_overrides = pd.concat([df_overrides, new_o], ignore_index=True)
-                        save_to_sheets(df_sessions, df_overrides); st.rerun()
+                        save_to_sheets(df_sessions, df_overrides)
+                        st.rerun()
                     if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                         st.session_state.prefill = row; st.success("Copiado! Vá para 'Registrar'.")
     else:
@@ -192,16 +204,20 @@ with tabs[1]: # REGISTRAR
         with c4: ac_in = st.number_input("Acertos", min_value=0, value=0)
         err_in = st.text_area("Quais questões errou? (Ex: Q02, Q05)")
         if st.form_submit_button("Salvar e Projetar"):
-            new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': str(int(t_in)), 'acertos': str(int(ac_in)), 'timestamp': str(datetime.now().timestamp()), 'erros': str(err_in)}])
+            new_r = pd.DataFrame([{
+                'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 
+                'total': int(t_in), 'acertos': int(ac_in), 
+                'timestamp': datetime.now().timestamp(), 'erros': str(err_in)
+            }])
             df_sessions = pd.concat([df_sessions, new_r], ignore_index=True)
             key = f"{m_in}-{a_in}".lower().replace(" ", "").replace("/", "-")
             df_overrides = df_overrides[df_overrides.id != key] if not df_overrides.empty else df_overrides
             if save_to_sheets(df_sessions, df_overrides):
-                st.session_state.prefill = None; st.success("Salvo!"); st.rerun()
+                st.session_state.prefill = None
+                st.rerun()
 
 with tabs[2]: # DESEMPENHO
     if not df_sessions.empty:
-        # Conversão de tipos para cálculo
         df_calc = df_sessions.copy()
         df_calc['total'] = pd.to_numeric(df_calc['total'], errors='coerce').fillna(1)
         df_calc['acertos'] = pd.to_numeric(df_calc['acertos'], errors='coerce').fillna(0)
@@ -218,8 +234,9 @@ with tabs[2]: # DESEMPENHO
 with tabs[3]: # HISTÓRICO
     if not df_sessions.empty:
         st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True, use_container_width=True)
-        if st.checkbox("Excluir linha"):
+        if st.checkbox("Habilitar exclusão"):
             idx_d = st.number_input("Índice da linha (veja na planilha)", min_value=0, max_value=len(df_sessions)-1, step=1)
             if st.button("Confirmar Exclusão Permanente"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx_d])
-                save_to_sheets(df_sessions, df_overrides); st.rerun()
+                save_to_sheets(df_sessions, df_overrides)
+                st.rerun()
