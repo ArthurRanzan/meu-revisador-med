@@ -31,12 +31,11 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- CONEXÃO COM GOOGLE SHEETS ---
-# Forçamos a conexão a usar os segredos configurados
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
     try:
-        # Tenta ler as abas. Se não existirem, o except cuida disso.
+        # Carrega dados das abas com tratamento de erro e remove linhas vazias
         df_studies = conn.read(worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
         
@@ -45,20 +44,14 @@ def load_all_data():
         
         return df_studies, df_adj
     except Exception:
-        # Retorna estruturas vazias se a planilha estiver limpa ou inacessível
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
     try:
-        # Normalização total dos dados para garantir que o Google Sheets aceite
-        # Transformamos tudo em texto/número limpo para evitar erros de "UnsupportedOperation"
-        df_studies = df_studies.fillna("")
-        df_studies['total'] = pd.to_numeric(df_studies['total'], errors='coerce').fillna(0).astype(int)
-        df_studies['acertos'] = pd.to_numeric(df_studies['acertos'], errors='coerce').fillna(0).astype(int)
-        df_studies['timestamp'] = pd.to_numeric(df_studies['timestamp'], errors='coerce').fillna(0)
-        
-        df_adj = df_adj.fillna("")
+        # Normalização total: transformamos tudo em texto/número limpo
+        df_studies = df_studies.astype(str).replace("nan", "")
+        df_adj = df_adj.astype(str).replace("nan", "")
 
         # Gravação nas abas específicas
         conn.update(worksheet="estudos", data=df_studies)
@@ -67,26 +60,32 @@ def save_to_sheets(df_studies, df_adj):
         st.cache_data.clear()
         return True
     except Exception as e:
-        st.error(f"Erro ao salvar: {str(e)}")
+        st.error(f"Erro ao salvar na planilha: {str(e)}")
+        st.info("💡 Lembrete: Verifique se as abas se chamam exatamente 'estudos' e 'ajustes'.")
         return False
 
 # Carregamento inicial
 df_sessions, df_overrides = load_all_data()
 
-# --- LÓGICA DE CICLOS (V3.2) ---
+# --- ENGINE DE PROJEÇÃO (LÓGICA V3.2) ---
 def calculate_projections(sessions_df, overrides_df):
     projections = []
     if sessions_df.empty: return pd.DataFrame()
     
-    # Prepara os dados numéricos para o cálculo
+    # Processa os dados numéricos para o cálculo
     temp_df = sessions_df.copy()
     temp_df['timestamp'] = pd.to_numeric(temp_df['timestamp'], errors='coerce')
     valid_sessions = temp_df.dropna(subset=['timestamp'])
     
     if valid_sessions.empty: return pd.DataFrame()
 
+    # Agrupa por Assunto e ordena por tempo (Sliding Window)
     groups = valid_sessions.sort_values('timestamp').groupby(['materia', 'assunto'])
-    overrides_dict = pd.Series(overrides_df.date.values, index=overrides_df.id).to_dict() if not overrides_df.empty else {}
+    
+    # Prepara dicionário de ajustes manuais
+    overrides_dict = {}
+    if not overrides_df.empty:
+        overrides_dict = pd.Series(overrides_df.date.values, index=overrides_df.id).to_dict()
 
     for (materia, assunto), group in groups:
         latest = group.iloc[-1]
@@ -94,8 +93,9 @@ def calculate_projections(sessions_df, overrides_df):
         num = len(group)
         
         try:
-            acc = (float(latest['acertos']) / float(latest['total'] if float(latest['total']) > 0 else 1)) * 100
-            initial_acc = (float(initial['acertos']) / float(initial['total'] if float(initial['total']) > 0 else 1)) * 100
+            total_v = float(latest['total']) if float(latest['total']) > 0 else 1
+            acc = (float(latest['acertos']) / total_v) * 100
+            initial_acc = (float(initial['acertos']) / (float(initial['total']) if float(initial['total']) > 0 else 1)) * 100
         except: acc = 0; initial_acc = 0
             
         try: last_dt = datetime.strptime(str(latest['data']), '%Y-%m-%d').date()
@@ -142,11 +142,9 @@ def calculate_projections(sessions_df, overrides_df):
 # --- INTERFACE ---
 st.title("📝 REVISADOR")
 
-# Alerta caso as abas não sejam encontradas
-if df_sessions.empty and not sessions_df_initial_check := load_all_data()[0].empty:
-    pass
-elif df_sessions.empty:
-    st.warning("Aguardando conexão ou abas 'estudos' e 'ajustes' não encontradas na planilha.")
+# Alerta de conexão
+if df_sessions.empty:
+    st.info("Aguardando seu primeiro registro de estudo ou carregando planilha...")
 
 tabs = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
@@ -177,7 +175,7 @@ with tabs[0]: # AGENDA
                     if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                         st.session_state.prefill = row; st.success("Copiado! Vá para 'Registrar'.")
     else:
-        st.write("Nada pendente. Registre um novo estudo!")
+        st.write("Nada pendente. Comece registrando um estudo!")
 
 with tabs[1]: # REGISTRAR
     st.subheader("Novo Registro de Estudo")
@@ -193,34 +191,35 @@ with tabs[1]: # REGISTRAR
         with c3: t_in = st.number_input("Total Questões", min_value=1, value=20)
         with c4: ac_in = st.number_input("Acertos", min_value=0, value=0)
         err_in = st.text_area("Quais questões errou? (Ex: Q02, Q05)")
-        if st.form_submit_button("Salvar Registro"):
-            new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': int(t_in), 'acertos': int(ac_in), 'timestamp': datetime.now().timestamp(), 'erros': err_in}])
+        if st.form_submit_button("Salvar e Projetar"):
+            new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': str(int(t_in)), 'acertos': str(int(ac_in)), 'timestamp': str(datetime.now().timestamp()), 'erros': str(err_in)}])
             df_sessions = pd.concat([df_sessions, new_r], ignore_index=True)
             key = f"{m_in}-{a_in}".lower().replace(" ", "").replace("/", "-")
             df_overrides = df_overrides[df_overrides.id != key] if not df_overrides.empty else df_overrides
             if save_to_sheets(df_sessions, df_overrides):
-                st.session_state.prefill = None
-                st.success("Salvo com sucesso!")
-                st.rerun()
+                st.session_state.prefill = None; st.success("Salvo!"); st.rerun()
 
 with tabs[2]: # DESEMPENHO
     if not df_sessions.empty:
-        df_sessions['total'] = pd.to_numeric(df_sessions['total'], errors='coerce').fillna(1)
-        df_sessions['acertos'] = pd.to_numeric(df_sessions['acertos'], errors='coerce').fillna(0)
-        df_sessions['nota'] = (df_sessions['acertos'] / df_sessions['total']) * 100
+        # Conversão de tipos para cálculo
+        df_calc = df_sessions.copy()
+        df_calc['total'] = pd.to_numeric(df_calc['total'], errors='coerce').fillna(1)
+        df_calc['acertos'] = pd.to_numeric(df_calc['acertos'], errors='coerce').fillna(0)
+        df_calc['nota'] = (df_calc['acertos'] / df_calc['total']) * 100
+        
         m1, m2 = st.columns(2)
-        m1.metric("Aproveitamento Geral", f"{df_sessions['nota'].mean():.1f}%")
-        m2.metric("Total Exercícios", int(df_sessions['total'].sum()))
-        subj_p = df_sessions.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0).reset_index()
+        m1.metric("Aproveitamento Geral", f"{df_calc['nota'].mean():.1f}%")
+        m2.metric("Total Exercícios", int(df_calc['total'].sum()))
+        
+        subj_p = df_calc.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0).reset_index()
         st.bar_chart(subj_p.set_index('materia'))
     else: st.info("Registre estudos para ver o desempenho.")
 
 with tabs[3]: # HISTÓRICO
     if not df_sessions.empty:
         st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True, use_container_width=True)
-        if st.checkbox("Habilitar exclusão"):
-            idx_d = st.number_input("Índice da linha", min_value=0, max_value=len(df_sessions)-1, step=1)
+        if st.checkbox("Excluir linha"):
+            idx_d = st.number_input("Índice da linha (veja na planilha)", min_value=0, max_value=len(df_sessions)-1, step=1)
             if st.button("Confirmar Exclusão Permanente"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx_d])
-                save_to_sheets(df_sessions, df_overrides)
-                st.rerun()
+                save_to_sheets(df_sessions, df_overrides); st.rerun()
