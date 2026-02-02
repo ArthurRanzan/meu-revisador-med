@@ -24,69 +24,64 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- CONEXÃO INDIVIDUAL (SIMPLIFICADA E CORRIGIDA) ---
+# --- CONEXÃO INDIVIDUAL (MÉTODO DIRETO) ---
 @st.cache_resource
 def get_gspread_client():
     try:
-        # Puxa o JSON do segredo
-        if "connections" in st.secrets and "gsheets" in st.secrets.connections:
-            raw_info = st.secrets["connections"]["gsheets"]["service_account"]
-        else:
-            st.error("Erro: Configuração [connections.gsheets] não encontrada no Streamlit Cloud.")
-            return None
+        # Puxa o conteúdo do segredo service_account
+        # Importante: O Streamlit pode carregar isto como um dicionário ou string
+        raw_info = st.secrets["connections"]["gsheets"]["service_account"]
         
-        # Converte para dicionário se for string
         if isinstance(raw_info, str):
             info = json.loads(raw_info)
         else:
+            # Se já for um dicionário (carregado via TOML), criamos uma cópia para editar
             info = dict(raw_info)
         
-        # Correção padrão de quebra de linha (apenas o necessário)
+        # CORREÇÃO ÚNICA E NECESSÁRIA:
+        # Transforma o texto "\n" em quebras de linha reais para o motor de criptografia
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace("\\n", "\n")
 
         return gspread.service_account_from_dict(info)
     except Exception as e:
-        st.error(f"Erro na Chave JSON: {e}")
+        st.error(f"Erro Crítico de Autenticação: {e}")
         return None
 
 def get_sheet():
     client = get_gspread_client()
     if client:
         try:
+            # Abre a tua planilha pelo ID fixo para evitar erros de URL
             return client.open_by_key("1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8")
         except Exception as e:
-            st.error(f"Erro ao abrir planilha: {e}")
+            st.error(f"Erro ao abrir a planilha: {e}. Verifique se o e-mail do robô é EDITOR na planilha.")
     return None
 
 def load_data():
     sheet = get_sheet()
     if not sheet: return pd.DataFrame(), pd.DataFrame()
     try:
-        # Lê aba de estudos
-        ws_estudos = sheet.worksheet("estudos")
-        data_estudos = ws_estudos.get_all_records()
-        df_studies = pd.DataFrame(data_estudos) if data_estudos else pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros'])
-        
-        # Lê aba de ajustes
-        ws_ajustes = sheet.worksheet("ajustes")
-        data_ajustes = ws_ajustes.get_all_records()
-        df_adj = pd.DataFrame(data_ajustes) if data_ajustes else pd.DataFrame(columns=['id', 'date'])
-        
+        # Lê os dados existentes
+        df_studies = pd.DataFrame(sheet.worksheet("estudos").get_all_records())
+        df_adj = pd.DataFrame(sheet.worksheet("ajustes").get_all_records())
         return df_studies, df_adj
     except Exception:
+        # Retorna tabelas vazias se a planilha estiver limpa
         return pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), \
                pd.DataFrame(columns=['id', 'date'])
 
-# --- SALVAMENTO ---
+# --- FUNÇÕES DE ESCRITA ---
 def save_session(new_row):
     sheet = get_sheet()
     if sheet:
         try:
             ws = sheet.worksheet("estudos")
-            # Ordem exata: data, materia, assunto, total, acertos, timestamp, erros
-            vals = [new_row['data'], new_row['materia'], new_row['assunto'], new_row['total'], new_row['acertos'], new_row['timestamp'], new_row['erros']]
-            ws.append_row(vals)
+            # Garante a ordem: data, materia, assunto, total, acertos, timestamp, erros
+            ws.append_row([
+                new_row['data'], new_row['materia'], new_row['assunto'],
+                new_row['total'], new_row['acertos'], new_row['timestamp'], new_row['erros']
+            ])
             return True
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
@@ -100,6 +95,7 @@ def save_override(key, date_str):
             data = ws.get_all_records()
             df = pd.DataFrame(data)
             if not df.empty and key in df['id'].values:
+                # Atualiza linha existente (+2 porque gspread começa em 1 e tem cabeçalho)
                 idx = df[df['id'] == key].index[0] + 2
                 ws.update_cell(idx, 2, date_str)
             else:
@@ -109,14 +105,15 @@ def save_override(key, date_str):
             st.error(f"Erro ao mudar data: {e}")
     return False
 
-# Inicialização
+# Inicializar os dados
 df_sessions, df_overrides = load_data()
 
-# --- ENGINE DE CÁLCULO ---
+# --- MOTOR DE CÁLCULO (A-B-C) ---
 def calculate_projections(sessions_df, overrides_df):
     if sessions_df.empty: return pd.DataFrame()
     
     df = sessions_df.copy()
+    # Converte colunas para números para evitar erros de cálculo
     df['total'] = pd.to_numeric(df['total'], errors='coerce').fillna(1)
     df['acertos'] = pd.to_numeric(df['acertos'], errors='coerce').fillna(0)
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
@@ -133,8 +130,8 @@ def calculate_projections(sessions_df, overrides_df):
         initial = group.iloc[0]
         num = len(group)
         
-        acc = (float(latest['acertos']) / float(latest['total'])) * 100
-        init_acc = (float(initial['acertos']) / float(initial['total'])) * 100
+        acc = (float(latest['acertos']) / float(latest['total'] if latest['total'] > 0 else 1)) * 100
+        init_acc = (float(initial['acertos']) / float(initial['total'] if initial['total'] > 0 else 1)) * 100
             
         try: last_dt = datetime.strptime(str(latest['data']), '%Y-%m-%d').date()
         except: last_dt = datetime.now().date()
@@ -142,11 +139,12 @@ def calculate_projections(sessions_df, overrides_df):
         days = 1
         action, case_type = "", ""
         
-        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Performance <70%.", "Caso A"
+        # Lógica de Revisão
+        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Refazer base.", "Caso A"
         elif init_acc < 70:
             if num == 1: days, action, case_type = 1, "D+1: Refazer erros.", "Caso A"
-            elif num == 2: days, action, case_type = 3 if acc >= 100 else 1, "Teste de Estabilidade.", "Caso A"
-            else: days, action, case_type = 15 if acc > 85 else 7, "Promovido.", "Caso C/B"
+            elif num == 2: days, action, case_type = (3 if acc >= 100 else 1), "Teste de Estabilidade.", "Caso A"
+            else: days, action, case_type = (15 if acc > 85 else 7), "Promoção Ciclo.", "Caso C/B"
         elif init_acc <= 85:
             days, action, case_type = (30, "Maestria.", "Caso C") if acc > 90 else (14, "Fixação.", "Caso B")
         else:
@@ -163,18 +161,17 @@ def calculate_projections(sessions_df, overrides_df):
 # --- INTERFACE ---
 st.title("📝 REVISADOR")
 
-# Sidebar
 with st.sidebar:
     if st.button("🔄 Sincronizar Agora"):
         st.cache_resource.clear()
         st.rerun()
     st.write("---")
-    st.caption("Uso Individual")
+    st.caption("Acesso Individual Arthur")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
 with tab1:
-    st.subheader("O que revisar hoje")
+    st.subheader("Cronograma")
     proj_df = calculate_projections(df_sessions, df_overrides)
     if not proj_df.empty:
         for _, row in proj_df.sort_values('Data').iterrows():
@@ -183,26 +180,27 @@ with tab1:
                 with c1:
                     st.write(f"**Fase:** {row['Caso']}")
                     st.info(row['Ação'])
-                    if str(row['Erros']) and str(row['Erros']) != 'nan': st.error(f"Erros: {row['Erros']}")
+                    if str(row['Erros']) and str(row['Erros']) != 'nan' and row['Erros'] != "":
+                        st.error(f"Erros: {row['Erros']}")
                 with c2:
                     new_d = st.date_input("Mudar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"d_{row['Key']}")
                     if new_d.strftime('%Y-%m-%d') != row['Data']:
                         if save_override(row['Key'], new_d.strftime('%Y-%m-%d')): st.rerun()
                     if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                         st.session_state.prefill = row
-    else: st.write("Tudo em dia!")
+    else: st.write("Agenda vazia. Registre um estudo!")
 
 with tab2:
     pre = st.session_state.get('prefill', None)
     with st.form("form_reg", clear_on_submit=True):
         m_in = st.selectbox("Matéria", SUBJECTS, index=SUBJECTS.index(pre['Materia']) if pre else 0)
         a_in = st.text_input("Assunto", value=pre['Assunto'] if pre else "")
-        c1, c2 = st.columns(2)
-        t_in = c1.number_input("Total Questões", min_value=1, value=20)
-        ac_in = c2.number_input("Acertos", min_value=0, value=0)
+        col1, col2 = st.columns(2)
+        t_in = col1.number_input("Total Questões", min_value=1, value=20)
+        ac_in = col2.number_input("Acertos", min_value=0, value=0)
         e_in = st.text_area("Questões Erradas")
-        if st.form_submit_button("Salvar Estudo"):
-            new_r = {'data': datetime.now().strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': t_in, 'acertos': ac_in, 'timestamp': datetime.now().timestamp(), 'erros': e_in}
+        if st.form_submit_button("Salvar Registro"):
+            new_r = {'data': datetime.now().strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': int(t_in), 'acertos': int(ac_in), 'timestamp': datetime.now().timestamp(), 'erros': str(e_in)}
             if save_session(new_r):
                 st.session_state.prefill = None
                 st.rerun()
@@ -211,9 +209,9 @@ with tab3:
     if not df_sessions.empty:
         df_c = df_sessions.copy()
         df_c['nota'] = (pd.to_numeric(df_c['acertos']) / pd.to_numeric(df_c['total'])) * 100
-        st.metric("Sua Média Geral", f"{df_c['nota'].mean():.1f}%")
+        st.metric("Média Geral", f"{df_c['nota'].mean():.1f}%")
         st.bar_chart(df_c.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0))
 
 with tab4:
     if not df_sessions.empty:
-        st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True)
+        st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True, use_container_width=True)
