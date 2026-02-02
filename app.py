@@ -3,7 +3,6 @@ import pandas as pd
 import gspread
 from datetime import datetime, timedelta
 import json
-import re
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Revisador", page_icon="📝", layout="wide")
@@ -25,15 +24,15 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- CONEXÃO INDIVIDUAL (ULTRA-ROBUSTA) ---
+# --- CONEXÃO INDIVIDUAL (SIMPLIFICADA E CORRIGIDA) ---
 @st.cache_resource
 def get_gspread_client():
     try:
-        # Puxa os dados do segredo
+        # Puxa o JSON do segredo
         if "connections" in st.secrets and "gsheets" in st.secrets.connections:
             raw_info = st.secrets["connections"]["gsheets"]["service_account"]
         else:
-            st.error("Erro: Cabeçalho [connections.gsheets] não encontrado nos Secrets.")
+            st.error("Erro: Configuração [connections.gsheets] não encontrada no Streamlit Cloud.")
             return None
         
         # Converte para dicionário se for string
@@ -42,18 +41,13 @@ def get_gspread_client():
         else:
             info = dict(raw_info)
         
-        # --- LIMPEZA DA CHAVE PRIVADA (RESOLVE REFRESHERROR) ---
+        # Correção padrão de quebra de linha (apenas o necessário)
         if "private_key" in info:
-            # Remove escapes extras e reconstrói as quebras de linha reais
-            key = info["private_key"]
-            key = key.replace("\\n", "\n") # Converte texto "\n" em quebra real
-            # Remove possíveis espaços ou aspas extras que impedem o Google de ler
-            key = re.sub(r'(?<!-)\n(?!=)', '', key) # Remove quebras acidentais no meio da base64
-            info["private_key"] = key
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
 
         return gspread.service_account_from_dict(info)
     except Exception as e:
-        st.error(f"Falha na Autenticação: {e}")
+        st.error(f"Erro na Chave JSON: {e}")
         return None
 
 def get_sheet():
@@ -62,15 +56,23 @@ def get_sheet():
         try:
             return client.open_by_key("1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8")
         except Exception as e:
-            st.error(f"Não consegui abrir a planilha. O bot é Editor? Erro: {e}")
+            st.error(f"Erro ao abrir planilha: {e}")
     return None
 
 def load_data():
     sheet = get_sheet()
     if not sheet: return pd.DataFrame(), pd.DataFrame()
     try:
-        df_studies = pd.DataFrame(sheet.worksheet("estudos").get_all_records())
-        df_adj = pd.DataFrame(sheet.worksheet("ajustes").get_all_records())
+        # Lê aba de estudos
+        ws_estudos = sheet.worksheet("estudos")
+        data_estudos = ws_estudos.get_all_records()
+        df_studies = pd.DataFrame(data_estudos) if data_estudos else pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros'])
+        
+        # Lê aba de ajustes
+        ws_ajustes = sheet.worksheet("ajustes")
+        data_ajustes = ws_ajustes.get_all_records()
+        df_adj = pd.DataFrame(data_ajustes) if data_ajustes else pd.DataFrame(columns=['id', 'date'])
+        
         return df_studies, df_adj
     except Exception:
         return pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), \
@@ -82,7 +84,9 @@ def save_session(new_row):
     if sheet:
         try:
             ws = sheet.worksheet("estudos")
-            ws.append_row(list(new_row.values()))
+            # Ordem exata: data, materia, assunto, total, acertos, timestamp, erros
+            vals = [new_row['data'], new_row['materia'], new_row['assunto'], new_row['total'], new_row['acertos'], new_row['timestamp'], new_row['erros']]
+            ws.append_row(vals)
             return True
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
@@ -159,13 +163,13 @@ def calculate_projections(sessions_df, overrides_df):
 # --- INTERFACE ---
 st.title("📝 REVISADOR")
 
-# Sidebar para ferramentas de suporte
+# Sidebar
 with st.sidebar:
     if st.button("🔄 Sincronizar Agora"):
         st.cache_resource.clear()
         st.rerun()
     st.write("---")
-    st.caption("Uso Individual - Logado como robô editor")
+    st.caption("Uso Individual")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
