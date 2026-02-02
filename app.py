@@ -13,8 +13,8 @@ SUBJECTS = [
     "Filosofia/Sociologia", "Inglês", "Redação"
 ]
 
-# URL da tua planilha (forçada no código para evitar erros de deteção)
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8/edit?usp=sharing"
+# URL Limpa (Removido o final /edit... para evitar Erro 400)
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8"
 
 # --- ESTILO VISUAL ---
 st.markdown("""
@@ -31,20 +31,18 @@ st.markdown("""
 with st.sidebar:
     st.header("🔍 Diagnóstico")
     if "connections" in st.secrets and "gsheets" in st.secrets.connections:
-        st.success("Configuração 'gsheets' encontrada!")
+        st.success("Configuração encontrada!")
         if "service_account" in st.secrets.connections.gsheets:
             st.success("Chave JSON detetada!")
-        else:
-            st.error("Chave JSON NÃO encontrada nos Secrets.")
     else:
-        st.error("Cabeçalho [connections.gsheets] não encontrado.")
+        st.error("Erro nos Secrets!")
 
 # --- CONEXÃO ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
     try:
-        # Forçamos a leitura usando a URL específica para garantir a ligação
+        # Tenta carregar as abas estudos e ajustes
         df_studies = conn.read(spreadsheet=SHEET_URL, worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
         
@@ -53,48 +51,40 @@ def load_all_data():
         
         return df_studies, df_adj
     except Exception as e:
-        st.warning(f"Aguardando dados iniciais ou erro: {str(e)}")
+        # Se as abas não existirem, retorna colunas vazias
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
     try:
-        # Limpeza profunda: O Google Sheets rejeita objetos complexos
-        # Convertemos tudo para strings ou inteiros simples
-        df_studies_save = df_studies.copy()
-        df_studies_save = df_studies_save.fillna("")
-        df_studies_save['total'] = pd.to_numeric(df_studies_save['total'], errors='coerce').fillna(0).astype(int)
-        df_studies_save['acertos'] = pd.to_numeric(df_studies_save['acertos'], errors='coerce').fillna(0).astype(int)
-        df_studies_save['timestamp'] = df_studies_save['timestamp'].astype(str)
-        
-        df_adj_save = df_adj.copy()
-        df_adj_save = df_adj_save.fillna("").astype(str)
+        # Limpeza Total para evitar HTTP 400 Bad Request
+        # Transformamos tudo em string para que o Google não rejeite formatos
+        df_studies_save = df_studies.astype(str).replace("nan", "").replace("<NA>", "")
+        df_adj_save = df_adj.astype(str).replace("nan", "").replace("<NA>", "")
 
-        # GRAVAÇÃO FORÇADA: Passamos o parâmetro spreadsheet explicitamente
+        # Gravação forçada especificando a URL e a Worksheet
         conn.update(spreadsheet=SHEET_URL, worksheet="estudos", data=df_studies_save)
         conn.update(spreadsheet=SHEET_URL, worksheet="ajustes", data=df_adj_save)
         
         st.cache_data.clear()
-        st.success("✅ Sincronizado com o Google Sheets!")
+        st.success("✅ Sincronizado com sucesso!")
         return True
     except Exception as e:
         st.error(f"Erro ao salvar: {str(e)}")
-        if "cannot be written to" in str(e):
-            st.info("💡 A biblioteca continua a tentar acesso público. Verifica se tens um ficheiro '.streamlit/secrets.toml' no GitHub que possa estar a interferir.")
         return False
 
-# Carregamento
+# Carregamento Inicial
 df_sessions, df_overrides = load_all_data()
 
 # --- LÓGICA DE CICLOS ---
 def calculate_projections(sessions_df, overrides_df):
-    projections = []
     if sessions_df.empty: return pd.DataFrame()
+    projections = []
     
+    # Prepara dados
     temp_df = sessions_df.copy()
     temp_df['timestamp'] = pd.to_numeric(temp_df['timestamp'], errors='coerce')
     valid_sessions = temp_df.dropna(subset=['timestamp'])
-    
     if valid_sessions.empty: return pd.DataFrame()
 
     groups = valid_sessions.sort_values('timestamp').groupby(['materia', 'assunto'])
@@ -106,8 +96,7 @@ def calculate_projections(sessions_df, overrides_df):
         num = len(group)
         
         try:
-            total_v = float(latest['total']) if float(latest['total']) > 0 else 1
-            acc = (float(latest['acertos']) / total_v) * 100
+            acc = (float(latest['acertos']) / float(latest['total'] if float(latest['total']) > 0 else 1)) * 100
             initial_acc = (float(initial['acertos']) / (float(initial['total']) if float(initial['total']) > 0 else 1)) * 100
         except: acc, initial_acc = 0, 0
             
@@ -116,7 +105,7 @@ def calculate_projections(sessions_df, overrides_df):
             
         days, action, case_type = 1, "", ""
         
-        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Foco na base.", "Rebaixado"
+        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Foco na base.", "Caso A"
         elif initial_acc < 70:
             if num == 1: days, action, case_type = 1, "D+1: Refazer erros.", "Caso A"
             elif num == 2:
@@ -162,10 +151,9 @@ with tabs[0]: # AGENDA
                 if new_d.strftime('%Y-%m-%d') != row['Data']:
                     new_o = pd.DataFrame([{'id': row['Key'], 'date': new_d.strftime('%Y-%m-%d')}])
                     df_overrides = pd.concat([df_overrides[df_overrides.id != row['Key']], new_o], ignore_index=True)
-                    save_to_sheets(df_sessions, df_overrides)
-                    st.rerun()
+                    save_to_sheets(df_sessions, df_overrides); st.rerun()
                 if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
-                    st.session_state.prefill = row; st.success("Copiado! Vai a 'Registrar'.")
+                    st.session_state.prefill = row; st.success("Dados copiados!")
     else: st.write("Nada pendente.")
 
 with tabs[1]: # REGISTRAR
@@ -185,19 +173,17 @@ with tabs[1]: # REGISTRAR
             new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': int(t_in), 'acertos': int(ac_in), 'timestamp': datetime.now().timestamp(), 'erros': err_in}])
             df_sessions = pd.concat([df_sessions, new_r], ignore_index=True)
             key = f"{m_in}-{a_in}".lower().replace(" ", "").replace("/", "-")
-            # Remove override antigo ao salvar nova sessão
-            new_overrides = df_overrides[df_overrides.id != key]
-            if save_to_sheets(df_sessions, new_overrides):
-                st.session_state.prefill = None
-                st.rerun()
+            if save_to_sheets(df_sessions, df_overrides[df_overrides.id != key]):
+                st.session_state.prefill = None; st.rerun()
 
 with tabs[2]: # DESEMPENHO
     if not df_sessions.empty:
-        df_sessions['total'] = pd.to_numeric(df_sessions['total'], errors='coerce').fillna(1)
-        df_sessions['acertos'] = pd.to_numeric(df_sessions['acertos'], errors='coerce').fillna(0)
-        df_sessions['nota'] = (df_sessions['acertos'] / df_sessions['total']) * 100
-        st.metric("Aproveitamento Geral", f"{df_sessions['nota'].mean():.1f}%")
-        st.bar_chart(df_sessions.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0))
+        df_calc = df_sessions.copy()
+        df_calc['total'] = pd.to_numeric(df_calc['total'], errors='coerce').fillna(1)
+        df_calc['acertos'] = pd.to_numeric(df_calc['acertos'], errors='coerce').fillna(0)
+        df_calc['nota'] = (df_calc['acertos'] / df_calc['total']) * 100
+        st.metric("Aproveitamento Geral", f"{df_calc['nota'].mean():.1f}%")
+        st.bar_chart(df_calc.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0))
     else: st.info("Sem dados.")
 
 with tabs[3]: # HISTÓRICO
@@ -207,5 +193,4 @@ with tabs[3]: # HISTÓRICO
             idx = st.number_input("Índice", min_value=0, max_value=len(df_sessions)-1, step=1)
             if st.button("Confirmar Exclusão"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx])
-                save_to_sheets(df_sessions, df_overrides)
-                st.rerun()
+                save_to_sheets(df_sessions, df_overrides); st.rerun()
