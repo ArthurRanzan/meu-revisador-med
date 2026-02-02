@@ -3,6 +3,7 @@ import pandas as pd
 import gspread
 from datetime import datetime, timedelta
 import json
+import re
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Revisador", page_icon="📝", layout="wide")
@@ -24,50 +25,58 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- CONEXÃO INDIVIDUAL (SIMPLIFICADA) ---
+# --- CONEXÃO INDIVIDUAL (ULTRA-ROBUSTA) ---
 @st.cache_resource
 def get_gspread_client():
     try:
-        # Tenta carregar o JSON do segredo. 
-        # O código abaixo é "blindado" para diferentes formas de colagem no Secrets.
-        raw_info = st.secrets["connections"]["gsheets"]["service_account"]
+        # Puxa os dados do segredo
+        if "connections" in st.secrets and "gsheets" in st.secrets.connections:
+            raw_info = st.secrets["connections"]["gsheets"]["service_account"]
+        else:
+            st.error("Erro: Cabeçalho [connections.gsheets] não encontrado nos Secrets.")
+            return None
         
-        # Se vier como string (comum no TOML), transforma em dicionário
+        # Converte para dicionário se for string
         if isinstance(raw_info, str):
             info = json.loads(raw_info)
         else:
             info = dict(raw_info)
         
-        # Correção vital para a chave privada (causa comum de RefreshError)
+        # --- LIMPEZA DA CHAVE PRIVADA (RESOLVE REFRESHERROR) ---
         if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-            
+            # Remove escapes extras e reconstrói as quebras de linha reais
+            key = info["private_key"]
+            key = key.replace("\\n", "\n") # Converte texto "\n" em quebra real
+            # Remove possíveis espaços ou aspas extras que impedem o Google de ler
+            key = re.sub(r'(?<!-)\n(?!=)', '', key) # Remove quebras acidentais no meio da base64
+            info["private_key"] = key
+
         return gspread.service_account_from_dict(info)
     except Exception as e:
-        st.error(f"Erro de Conexão: {e}")
+        st.error(f"Falha na Autenticação: {e}")
         return None
 
 def get_sheet():
     client = get_gspread_client()
     if client:
-        # ID fixo da sua planilha para não ter erro de URL
-        return client.open_by_key("1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8")
+        try:
+            return client.open_by_key("1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8")
+        except Exception as e:
+            st.error(f"Não consegui abrir a planilha. O bot é Editor? Erro: {e}")
     return None
 
 def load_data():
     sheet = get_sheet()
     if not sheet: return pd.DataFrame(), pd.DataFrame()
     try:
-        # Carrega as abas estudos e ajustes
         df_studies = pd.DataFrame(sheet.worksheet("estudos").get_all_records())
         df_adj = pd.DataFrame(sheet.worksheet("ajustes").get_all_records())
         return df_studies, df_adj
     except Exception:
-        # Se estiver vazia, cria os dataframes com os nomes das colunas certos
         return pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), \
                pd.DataFrame(columns=['id', 'date'])
 
-# --- SALVAMENTO DIRETO ---
+# --- SALVAMENTO ---
 def save_session(new_row):
     sheet = get_sheet()
     if sheet:
@@ -76,7 +85,7 @@ def save_session(new_row):
             ws.append_row(list(new_row.values()))
             return True
         except Exception as e:
-            st.error(f"Falha ao salvar: {e}")
+            st.error(f"Erro ao salvar: {e}")
     return False
 
 def save_override(key, date_str):
@@ -87,25 +96,22 @@ def save_override(key, date_str):
             data = ws.get_all_records()
             df = pd.DataFrame(data)
             if not df.empty and key in df['id'].values:
-                # Atualiza a linha existente
                 idx = df[df['id'] == key].index[0] + 2
                 ws.update_cell(idx, 2, date_str)
             else:
-                # Adiciona nova linha
                 ws.append_row([key, date_str])
             return True
         except Exception as e:
-            st.error(f"Falha ao mudar data: {e}")
+            st.error(f"Erro ao mudar data: {e}")
     return False
 
-# Inicialização dos dados
+# Inicialização
 df_sessions, df_overrides = load_data()
 
 # --- ENGINE DE CÁLCULO ---
 def calculate_projections(sessions_df, overrides_df):
     if sessions_df.empty: return pd.DataFrame()
     
-    # Prepara dados para garantir que os números funcionem
     df = sessions_df.copy()
     df['total'] = pd.to_numeric(df['total'], errors='coerce').fillna(1)
     df['acertos'] = pd.to_numeric(df['acertos'], errors='coerce').fillna(0)
@@ -132,7 +138,6 @@ def calculate_projections(sessions_df, overrides_df):
         days = 1
         action, case_type = "", ""
         
-        # Lógica Simplificada A-B-C
         if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Performance <70%.", "Caso A"
         elif init_acc < 70:
             if num == 1: days, action, case_type = 1, "D+1: Refazer erros.", "Caso A"
@@ -154,10 +159,13 @@ def calculate_projections(sessions_df, overrides_df):
 # --- INTERFACE ---
 st.title("📝 REVISADOR")
 
-# Botão de emergência na barra lateral
-if st.sidebar.button("Forçar Sincronização"):
-    st.cache_resource.clear()
-    st.rerun()
+# Sidebar para ferramentas de suporte
+with st.sidebar:
+    if st.button("🔄 Sincronizar Agora"):
+        st.cache_resource.clear()
+        st.rerun()
+    st.write("---")
+    st.caption("Uso Individual - Logado como robô editor")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
@@ -169,14 +177,14 @@ with tab1:
             with st.expander(f"{row['Data']} | {row['Materia']} - {row['Assunto']}"):
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.write(f"**Status:** {row['Caso']}")
+                    st.write(f"**Fase:** {row['Caso']}")
                     st.info(row['Ação'])
-                    if str(row['Erros']): st.error(f"Erros: {row['Erros']}")
+                    if str(row['Erros']) and str(row['Erros']) != 'nan': st.error(f"Erros: {row['Erros']}")
                 with c2:
-                    new_d = st.date_input("Adiar/Mudar", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"d_{row['Key']}")
+                    new_d = st.date_input("Mudar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"d_{row['Key']}")
                     if new_d.strftime('%Y-%m-%d') != row['Data']:
                         if save_override(row['Key'], new_d.strftime('%Y-%m-%d')): st.rerun()
-                    if st.button("Iniciar", key=f"b_{row['Key']}"):
+                    if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                         st.session_state.prefill = row
     else: st.write("Tudo em dia!")
 
