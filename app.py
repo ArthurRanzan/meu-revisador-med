@@ -13,7 +13,7 @@ SUBJECTS = [
     "Filosofia/Sociologia", "Inglês", "Redação"
 ]
 
-# URL Limpa (Removido o final /edit... para evitar Erro 400)
+# URL da planilha - Removido qualquer sufixo para evitar erro 400
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8"
 
 # --- ESTILO VISUAL ---
@@ -27,22 +27,26 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- DIAGNÓSTICO DE CONEXÃO ---
+# --- DIAGNÓSTICO NA BARRA LATERAL ---
 with st.sidebar:
-    st.header("🔍 Diagnóstico")
+    st.header("🔍 Conexão")
     if "connections" in st.secrets and "gsheets" in st.secrets.connections:
-        st.success("Configuração encontrada!")
+        st.success("Configuração OK!")
         if "service_account" in st.secrets.connections.gsheets:
-            st.success("Chave JSON detetada!")
+            st.success("Chave JSON ativa!")
     else:
         st.error("Erro nos Secrets!")
+    
+    if st.button("Limpar Cache de Conexão"):
+        st.cache_data.clear()
+        st.rerun()
 
 # --- CONEXÃO ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
     try:
-        # Tenta carregar as abas estudos e ajustes
+        # Lemos os dados forçando o uso da URL para garantir a conta de serviço
         df_studies = conn.read(spreadsheet=SHEET_URL, worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
         
@@ -51,29 +55,36 @@ def load_all_data():
         
         return df_studies, df_adj
     except Exception as e:
-        # Se as abas não existirem, retorna colunas vazias
+        # Caso a planilha esteja vazia (apenas cabeçalhos)
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
     try:
-        # Limpeza Total para evitar HTTP 400 Bad Request
-        # Transformamos tudo em string para que o Google não rejeite formatos
-        df_studies_save = df_studies.astype(str).replace("nan", "").replace("<NA>", "")
-        df_adj_save = df_adj.astype(str).replace("nan", "").replace("<NA>", "")
+        # LIMPEZA CRÍTICA: O Erro 400 acontece por causa de formatos incompatíveis.
+        # Vamos converter TUDO para string (texto) antes de enviar.
+        df_studies_save = df_studies.copy()
+        for col in df_studies_save.columns:
+            df_studies_save[col] = df_studies_save[col].astype(str).replace("nan", "").replace("<NA>", "")
+        
+        df_adj_save = df_adj.copy()
+        for col in df_adj_save.columns:
+            df_adj_save[col] = df_adj_save[col].astype(str).replace("nan", "").replace("<NA>", "")
 
-        # Gravação forçada especificando a URL e a Worksheet
+        # Gravação forçada especificando URL e Worksheet
         conn.update(spreadsheet=SHEET_URL, worksheet="estudos", data=df_studies_save)
         conn.update(spreadsheet=SHEET_URL, worksheet="ajustes", data=df_adj_save)
         
         st.cache_data.clear()
-        st.success("✅ Sincronizado com sucesso!")
+        st.success("✅ Dados gravados com sucesso!")
         return True
     except Exception as e:
         st.error(f"Erro ao salvar: {str(e)}")
+        if "Bad Request" in str(e):
+            st.info("💡 Dica: Verifique se as colunas na planilha estão na ordem certa e sem filtros ativos.")
         return False
 
-# Carregamento Inicial
+# Inicializar dados
 df_sessions, df_overrides = load_all_data()
 
 # --- LÓGICA DE CICLOS ---
@@ -81,7 +92,6 @@ def calculate_projections(sessions_df, overrides_df):
     if sessions_df.empty: return pd.DataFrame()
     projections = []
     
-    # Prepara dados
     temp_df = sessions_df.copy()
     temp_df['timestamp'] = pd.to_numeric(temp_df['timestamp'], errors='coerce')
     valid_sessions = temp_df.dropna(subset=['timestamp'])
@@ -105,24 +115,24 @@ def calculate_projections(sessions_df, overrides_df):
             
         days, action, case_type = 1, "", ""
         
-        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Foco na base.", "Caso A"
+        if num > 1 and acc < 70: days, action, case_type = 1, "🚨 Rebaixado: Foco na base do Caso A.", "Caso A"
         elif initial_acc < 70:
-            if num == 1: days, action, case_type = 1, "D+1: Refazer erros.", "Caso A"
+            if num == 1: days, action, case_type = 1, "D+1: Refazer erros (Foco 100%).", "Caso A"
             elif num == 2:
-                if acc >= 100: days, action, case_type = 3, "D+4: Estabilidade.", "Caso A"
-                else: days, action, case_type = 1, "⚠️ Repetir D+1.", "Caso A"
+                if acc >= 100: days, action, case_type = 3, "D+4: Teste de estabilidade.", "Caso A"
+                else: days, action, case_type = 1, "⚠️ Repetir D+1: Necessário 100%.", "Caso A"
             else:
                 if acc > 85: days, action, case_type = 15, "✅ Promovido.", "Caso C"
-                else: days, action, case_type = 7, "❌ Reforço.", "Caso B"
+                else: days, action, case_type = 7, "❌ Reforço necessário.", "Caso B"
         elif initial_acc <= 85:
             if num == 1: days, action, case_type = 7, "D+7: Bateria mista.", "Caso B"
             else:
-                if acc > 90: days, action, case_type = 30, "🔥 Maestria.", "Caso C"
-                else: days, action, case_type = 14, "Fixação.", "Caso B"
+                if acc > 90: days, action, case_type = 30, "🔥 Maestria alcançada.", "Caso C"
+                else: days, action, case_type = 14, "Fixação de conceitos.", "Caso B"
         else:
             if acc < 80: days, action, case_type = 7, "📉 Queda rendimento.", "Caso B"
-            elif num == 1: days, action, case_type = 15, "D+15: Simulado.", "Caso C"
-            else: days, action, case_type = 45, "Manutenção.", "Caso C"
+            elif num == 1: days, action, case_type = 15, "D+15: Simulado focado.", "Caso C"
+            else: days, action, case_type = 45, "Manutenção de longo prazo.", "Caso C"
 
         proj_dt = last_dt + timedelta(days=max(days, 1))
         proj_str = proj_dt.strftime('%Y-%m-%d')
@@ -139,7 +149,7 @@ st.title("📝 REVISADOR")
 tabs = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
 with tabs[0]: # AGENDA
-    st.subheader("Cronograma")
+    st.subheader("Cronograma Inteligente")
     proj_df = calculate_projections(df_sessions, df_overrides)
     if not proj_df.empty:
         proj_df = proj_df.sort_values('Data')
@@ -147,14 +157,14 @@ with tabs[0]: # AGENDA
             with st.expander(f"{row['Data']} | {row['Materia']} - {row['Assunto']}"):
                 st.markdown(f"**Fase:** {row['Caso']} | **Ação:** {row['Ação']}")
                 if str(row['Erros']) != "" and str(row['Erros']) != "nan": st.error(f"⚠️ Erros: {row['Erros']}")
-                new_d = st.date_input("Ajustar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"d_{row['Key']}")
+                new_d = st.date_input("Mudar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"d_{row['Key']}")
                 if new_d.strftime('%Y-%m-%d') != row['Data']:
                     new_o = pd.DataFrame([{'id': row['Key'], 'date': new_d.strftime('%Y-%m-%d')}])
                     df_overrides = pd.concat([df_overrides[df_overrides.id != row['Key']], new_o], ignore_index=True)
                     save_to_sheets(df_sessions, df_overrides); st.rerun()
                 if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
-                    st.session_state.prefill = row; st.success("Dados copiados!")
-    else: st.write("Nada pendente.")
+                    st.session_state.prefill = row; st.success("Copiado! Vai a 'Registrar'.")
+    else: st.write("Nada pendente. Registra o teu primeiro estudo!")
 
 with tabs[1]: # REGISTRAR
     st.subheader("Novo Registro")
@@ -163,12 +173,12 @@ with tabs[1]: # REGISTRAR
         c1, c2 = st.columns(2)
         with c1:
             m_in = st.selectbox("Matéria", SUBJECTS, index=SUBJECTS.index(pre['Materia']) if pre else 0)
-            d_in = st.date_input("Data", value=datetime.now())
+            d_in = st.date_input("Data Realizada", value=datetime.now())
         with c2: a_in = st.text_input("Assunto", value=pre['Assunto'] if pre else "")
         c3, c4 = st.columns(2)
         with c3: t_in = st.number_input("Total Questões", min_value=1, value=20)
         with c4: ac_in = st.number_input("Acertos", min_value=0, value=0)
-        err_in = st.text_area("IDs das Questões Erradas")
+        err_in = st.text_area("Questões Erradas (IDs)")
         if st.form_submit_button("Salvar Registro"):
             new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': int(t_in), 'acertos': int(ac_in), 'timestamp': datetime.now().timestamp(), 'erros': err_in}])
             df_sessions = pd.concat([df_sessions, new_r], ignore_index=True)
@@ -184,13 +194,13 @@ with tabs[2]: # DESEMPENHO
         df_calc['nota'] = (df_calc['acertos'] / df_calc['total']) * 100
         st.metric("Aproveitamento Geral", f"{df_calc['nota'].mean():.1f}%")
         st.bar_chart(df_calc.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0))
-    else: st.info("Sem dados.")
+    else: st.info("Sem dados para exibir.")
 
 with tabs[3]: # HISTÓRICO
     if not df_sessions.empty:
         st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True, use_container_width=True)
         if st.checkbox("Excluir linha"):
-            idx = st.number_input("Índice", min_value=0, max_value=len(df_sessions)-1, step=1)
-            if st.button("Confirmar Exclusão"):
+            idx = st.number_input("Índice (ID da linha)", min_value=0, max_value=len(df_sessions)-1, step=1)
+            if st.button("Apagar Permanentemente"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx])
                 save_to_sheets(df_sessions, df_overrides); st.rerun()
