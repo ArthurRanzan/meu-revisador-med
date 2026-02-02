@@ -40,17 +40,13 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- FUNÇÕES AUXILIARES ---
-def get_local_date_str(date=None):
-    if date is None: date = datetime.now()
-    return date.strftime('%Y-%m-%d')
-
 # --- CONEXÃO E DADOS ---
+# A conexão usa as Secrets configuradas no Streamlit Cloud
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
     try:
-        # Tenta carregar as abas. Se não existirem, o erro é tratado no except.
+        # Carrega dados das abas com tratamento de erro
         df_studies = conn.read(worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
         
@@ -58,25 +54,31 @@ def load_all_data():
         df_adj = df_adj.dropna(how='all')
         
         return df_studies, df_adj
-    except Exception:
-        # Retorna dataframes vazios com as colunas corretas caso a planilha esteja inacessível
+    except Exception as e:
+        # Se as abas não existirem ou houver erro de permissão
+        st.warning("Aguardando conexão inicial com a planilha ou abas não encontradas.")
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
     try:
-        # Converte colunas para garantir compatibilidade
+        # 1. Normalização de dados (Evita UnsupportedOperationError por tipos errados)
+        df_studies = df_studies.fillna("")
         df_studies['total'] = pd.to_numeric(df_studies['total'], errors='coerce').fillna(0).astype(int)
         df_studies['acertos'] = pd.to_numeric(df_studies['acertos'], errors='coerce').fillna(0).astype(int)
+        df_studies['timestamp'] = pd.to_numeric(df_studies['timestamp'], errors='coerce').fillna(0)
         
-        # Grava os dados nas abas correspondentes
+        df_adj = df_adj.fillna("")
+
+        # 2. Gravação forçada nas abas
         conn.update(worksheet="estudos", data=df_studies)
         conn.update(worksheet="ajustes", data=df_adj)
+        
         st.cache_data.clear()
         return True
     except Exception as e:
-        st.error(f"Erro de conexão com a planilha: {e}")
-        st.info("Verifique se as abas 'estudos' e 'ajustes' existem e se o bot tem permissão de Editor.")
+        st.error(f"Falha Crítica na Planilha: {str(e)}")
+        st.info("💡 Dica: Verifique se ativou a 'Google Drive API' além da 'Google Sheets API' no console.")
         return False
 
 # Carregamento inicial
@@ -88,12 +90,14 @@ def calculate_projections(sessions_df, overrides_df):
     if sessions_df.empty:
         return pd.DataFrame()
     
-    # Prepara os dados
+    # Processa apenas linhas válidas
     sessions_df['timestamp'] = pd.to_numeric(sessions_df['timestamp'], errors='coerce')
-    sessions_df = sessions_df.dropna(subset=['timestamp'])
+    valid_sessions = sessions_df.dropna(subset=['timestamp'])
     
-    # Agrupa por Tópico para pegar o estado atual do ciclo
-    groups = sessions_df.sort_values('timestamp').groupby(['materia', 'assunto'])
+    if valid_sessions.empty: return pd.DataFrame()
+
+    # Agrupa por Assunto para definir o estado do ciclo
+    groups = valid_sessions.sort_values('timestamp').groupby(['materia', 'assunto'])
     overrides_dict = pd.Series(overrides_df.date.values, index=overrides_df.id).to_dict() if not overrides_df.empty else {}
 
     for (materia, assunto), group in groups:
@@ -102,14 +106,12 @@ def calculate_projections(sessions_df, overrides_df):
         num = len(group)
         
         try:
-            total_val = float(latest['total']) if float(latest['total']) > 0 else 1
-            acc = (float(latest['acertos']) / total_val) * 100
-            init_total = float(initial['total']) if float(initial['total']) > 0 else 1
-            initial_acc = (float(initial['acertos']) / init_total) * 100
+            acc = (float(latest['acertos']) / float(latest['total'] if float(latest['total']) > 0 else 1)) * 100
+            initial_acc = (float(initial['acertos']) / float(initial['total'] if float(initial['total']) > 0 else 1)) * 100
         except:
             acc = 0
             initial_acc = 0
-        
+            
         try:
             last_dt = datetime.strptime(str(latest['data']), '%Y-%m-%d').date()
         except:
@@ -118,31 +120,30 @@ def calculate_projections(sessions_df, overrides_df):
         days = 1
         action, case_type, urgency = "", "", "low"
         
-        # Lógica Condicional ABC
+        # Lógica ABC robusta
         if num > 1 and acc < 70:
-            days, action, case_type, urgency = 1, "🚨 Rebaixado: Performance <70%. Reiniciar Caso A.", "Caso A - Rebaixado", "high"
+            days, action, case_type, urgency = 1, "🚨 Rebaixado: Foco total na base do Caso A.", "Caso A - Rebaixado", "high"
         elif initial_acc < 70:
-            if num == 1: days, action, case_type, urgency = 1, "D+1: Refazer erros (Foco 100% de acerto).", "Caso A - Resgate", "high"
+            if num == 1: days, action, case_type, urgency = 1, "D+1: Refazer erros específicos.", "Caso A - Resgate", "high"
             elif num == 2:
                 if acc >= 100: days, action, case_type, urgency = 3, "D+4: Teste de estabilidade.", "Caso A - Estabilidade", "medium"
-                else: days, action, case_type, urgency = 1, "⚠️ Repetir erros: Necessário 100% no D+1.", "Caso A - Repetir", "high"
+                else: days, action, case_type, urgency = 1, "⚠️ Repetir D+1: Necessário 100% de acerto.", "Caso A - Repetir", "high"
             else:
-                if acc > 85: days, action, case_type, urgency = 15, "✅ Promovido: Revisão de manutenção.", "Caso A -> C", "low"
+                if acc > 85: days, action, case_type, urgency = 15, "✅ Promovido: Manutenção.", "Caso A -> C", "low"
                 else: days, action, case_type, urgency = 7, "❌ Reforço: Revisão em 7 dias.", "Caso A -> B", "medium"
         elif initial_acc <= 85:
-            if num == 1: days, action, case_type, urgency = 7, "D+7: Bateria mista de questões.", "Caso B - Lapidação", "medium"
+            if num == 1: days, action, case_type, urgency = 7, "D+7: Bateria mista (Obj+Disc).", "Caso B - Lapidação", "medium"
             else:
-                if acc > 90: days, action, case_type, urgency = 30, "🔥 Maestria: Nota >90%. Próxima em 30 dias.", "Caso B -> C", "low"
-                else: days, action, case_type, urgency = 14, "Fixação: Mantendo nível. Nova bateria em 14 dias.", "Caso B - Fixação", "medium"
+                if acc > 90: days, action, case_type, urgency = 30, "🔥 Maestria: Próxima em 30 dias.", "Caso B -> C", "low"
+                else: days, action, case_type, urgency = 14, "Fixação: Bateria em 14 dias.", "Caso B - Fixação", "medium"
         else:
-            if acc < 80: days, action, case_type, urgency = 7, "📉 Queda: Nota <80%. Retorno para ciclo de 7 dias.", "Caso C -> B", "medium"
+            if acc < 80: days, action, case_type, urgency = 7, "📉 Queda (<80%): Retorno ciclo 7 dias.", "Caso C -> B", "medium"
             elif num == 1: days, action, case_type, urgency = 15, "D+15: Simulado focado em velocidade.", "Caso C - Maestria", "low"
             else: days, action, case_type, urgency = 45, "D+45: Manutenção Permanente.", "Caso C - Manutenção", "low"
 
         proj_dt = last_dt + timedelta(days=max(days, 1))
         proj_str = proj_dt.strftime('%Y-%m-%d')
         
-        # Aplica ajuste manual
         key = f"{materia}-{assunto}".lower().replace(" ", "").replace("/", "-")
         if key in overrides_dict:
             proj_str = overrides_dict[key]
@@ -161,12 +162,12 @@ st.title("📝 REVISADOR")
 tabs = st.tabs(["📅 Agenda", "➕ Registrar", "📊 Desempenho", "📜 Histórico"])
 
 with tabs[0]: # AGENDA
-    st.subheader("Cronograma de Revisões")
+    st.subheader("Cronograma Inteligente")
     proj_df = calculate_projections(df_sessions, df_overrides)
     
     if not proj_df.empty:
         proj_df = proj_df.sort_values('Data')
-        filtro_agenda = st.selectbox("Filtrar Agenda", ["Todas"] + SUBJECTS, key="filter_agenda")
+        filtro_agenda = st.selectbox("Filtrar Matéria", ["Todas"] + SUBJECTS, key="f_agenda")
         if filtro_agenda != "Todas":
             proj_df = proj_df[proj_df.Materia == filtro_agenda]
 
@@ -179,21 +180,21 @@ with tabs[0]: # AGENDA
                     if row['Erros'] and str(row['Erros']) != "nan":
                         st.error(f"⚠️ Refazer erros: {row['Erros']}")
                 with c2:
-                    new_date = st.date_input("Mudar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"date_{row['Key']}")
-                    if new_date.strftime('%Y-%m-%d') != row['Data']:
-                        new_ov = pd.DataFrame([{'id': row['Key'], 'date': new_date.strftime('%Y-%m-%d')}])
-                        temp_ov = df_overrides[df_overrides.id != row['Key']] if not df_overrides.empty else df_overrides
-                        df_overrides = pd.concat([temp_ov, new_ov], ignore_index=True)
+                    new_dt = st.date_input("Mudar data", value=datetime.strptime(row['Data'], '%Y-%m-%d'), key=f"date_{row['Key']}")
+                    if new_dt.strftime('%Y-%m-%d') != row['Data']:
+                        new_ov = pd.DataFrame([{'id': row['Key'], 'date': new_dt.strftime('%Y-%m-%d')}])
+                        df_overrides = df_overrides[df_overrides.id != row['Key']] if not df_overrides.empty else df_overrides
+                        df_overrides = pd.concat([df_overrides, new_ov], ignore_index=True)
                         save_to_sheets(df_sessions, df_overrides)
                         st.rerun()
                     if st.button("Iniciar Estudo", key=f"btn_{row['Key']}"):
                         st.session_state.prefill = row
-                        st.success("Dados copiados! Vá para a aba 'Registrar'.")
+                        st.success("Copiado! Vá para 'Registrar'.")
     else:
-        st.write("Nada pendente. Registre um novo estudo para começar!")
+        st.write("Sem revisões agendadas.")
 
 with tabs[1]: # REGISTRAR
-    st.subheader("Novo Registro")
+    st.subheader("Novo Registro de Estudo")
     pre = st.session_state.get('prefill', None)
     with st.form("form_reg", clear_on_submit=True):
         c1, c2 = st.columns(2)
@@ -207,8 +208,8 @@ with tabs[1]: # REGISTRAR
             t_input = st.number_input("Total de Questões", min_value=1, value=20)
         with c4:
             ac_input = st.number_input("Acertos", min_value=0, value=0)
-        err_input = st.text_area("IDs das Questões Erradas")
-        if st.form_submit_button("Salvar Registro"):
+        err_input = st.text_area("Quais questões errou? (Ex: Q02, Q05)")
+        if st.form_submit_button("Salvar e Projetar"):
             new_row = pd.DataFrame([{
                 'data': d_input.strftime('%Y-%m-%d'), 'materia': m_input, 'assunto': a_input,
                 'total': int(t_input), 'acertos': int(ac_input), 'timestamp': datetime.now().timestamp(),
@@ -219,7 +220,7 @@ with tabs[1]: # REGISTRAR
             df_overrides = df_overrides[df_overrides.id != key] if not df_overrides.empty else df_overrides
             if save_to_sheets(df_sessions, df_overrides):
                 st.session_state.prefill = None
-                st.success("Sessão registrada com sucesso!")
+                st.success("Salvo com sucesso!")
                 st.rerun()
 
 with tabs[2]: # DESEMPENHO
@@ -233,13 +234,13 @@ with tabs[2]: # DESEMPENHO
         subj_data = df_sessions.groupby('materia')['nota'].mean().reindex(SUBJECTS).fillna(0).reset_index()
         st.bar_chart(subj_data.set_index('materia'))
     else:
-        st.info("Registre estudos para ver o desempenho.")
+        st.info("Registre estudos para ver o gráfico.")
 
 with tabs[3]: # HISTÓRICO
     if not df_sessions.empty:
         st.dataframe(df_sessions.sort_values('timestamp', ascending=False), hide_index=True, use_container_width=True)
-        if st.checkbox("Habilitar exclusão"):
-            idx_del = st.number_input("ID para apagar", min_value=0, max_value=len(df_sessions)-1, step=1)
+        if st.checkbox("Excluir registro"):
+            idx_del = st.number_input("ID da linha para apagar", min_value=0, max_value=len(df_sessions)-1, step=1)
             if st.button("Confirmar Exclusão"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx_del])
                 save_to_sheets(df_sessions, df_overrides)
