@@ -13,17 +13,21 @@ SUBJECTS = [
     "Filosofia/Sociologia", "Inglês", "Redação"
 ]
 
+# URL da tua planilha (forçada no código para evitar erros de deteção)
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1TQO6bP2RmhZR_wBO7f8B7BEBbjonmt9f7ShqTdCxrg8/edit?usp=sharing"
+
 # --- ESTILO VISUAL ---
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #f1f5f9; }
-    .stButton>button { width: 100%; border-radius: 12px; font-weight: 800; background-color: #2563eb; color: white; }
+    .stButton>button { width: 100%; border-radius: 12px; font-weight: 800; background-color: #2563eb; color: white; border: none; padding: 0.6rem; }
+    .stButton>button:hover { background-color: #1d4ed8; }
     div[data-testid="stMetricValue"] { font-weight: 900; color: #60a5fa; }
-    div[data-testid="stExpander"] { border: 1px solid #1e293b; border-radius: 16px; background-color: #1e293b50; }
+    div[data-testid="stExpander"] { border: 1px solid #1e293b; border-radius: 16px; background-color: #1e293b50; margin-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- DIAGNÓSTICO DE CONEXÃO (AJUDA A ACHAR O ERRO) ---
+# --- DIAGNÓSTICO DE CONEXÃO ---
 with st.sidebar:
     st.header("🔍 Diagnóstico")
     if "connections" in st.secrets and "gsheets" in st.secrets.connections:
@@ -31,7 +35,7 @@ with st.sidebar:
         if "service_account" in st.secrets.connections.gsheets:
             st.success("Chave JSON detetada!")
         else:
-            st.error("Chave JSON NÃO detetada nos Secrets.")
+            st.error("Chave JSON NÃO encontrada nos Secrets.")
     else:
         st.error("Cabeçalho [connections.gsheets] não encontrado.")
 
@@ -40,19 +44,23 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_all_data():
     try:
-        df_studies = conn.read(worksheet="estudos", ttl=0)
+        # Forçamos a leitura usando a URL específica para garantir a ligação
+        df_studies = conn.read(spreadsheet=SHEET_URL, worksheet="estudos", ttl=0)
         df_studies = df_studies.dropna(how='all')
-        df_adj = conn.read(worksheet="ajustes", ttl=0)
+        
+        df_adj = conn.read(spreadsheet=SHEET_URL, worksheet="ajustes", ttl=0)
         df_adj = df_adj.dropna(how='all')
+        
         return df_studies, df_adj
-    except Exception:
+    except Exception as e:
+        st.warning(f"Aguardando dados iniciais ou erro: {str(e)}")
         return (pd.DataFrame(columns=['data', 'materia', 'assunto', 'total', 'acertos', 'timestamp', 'erros']), 
                 pd.DataFrame(columns=['id', 'date']))
 
 def save_to_sheets(df_studies, df_adj):
     try:
-        # Limpeza absoluta dos dados antes de enviar ao Google
-        # O Google Sheets rejeita objetos complexos; transformamos tudo em string ou int puro
+        # Limpeza profunda: O Google Sheets rejeita objetos complexos
+        # Convertemos tudo para strings ou inteiros simples
         df_studies_save = df_studies.copy()
         df_studies_save = df_studies_save.fillna("")
         df_studies_save['total'] = pd.to_numeric(df_studies_save['total'], errors='coerce').fillna(0).astype(int)
@@ -62,16 +70,17 @@ def save_to_sheets(df_studies, df_adj):
         df_adj_save = df_adj.copy()
         df_adj_save = df_adj_save.fillna("").astype(str)
 
-        # Gravação forçada
-        conn.update(worksheet="estudos", data=df_studies_save)
-        conn.update(worksheet="ajustes", data=df_adj_save)
+        # GRAVAÇÃO FORÇADA: Passamos o parâmetro spreadsheet explicitamente
+        conn.update(spreadsheet=SHEET_URL, worksheet="estudos", data=df_studies_save)
+        conn.update(spreadsheet=SHEET_URL, worksheet="ajustes", data=df_adj_save)
         
         st.cache_data.clear()
+        st.success("✅ Sincronizado com o Google Sheets!")
         return True
     except Exception as e:
         st.error(f"Erro ao salvar: {str(e)}")
         if "cannot be written to" in str(e):
-            st.info("💡 A planilha está a ser lida como 'Pública'. O Streamlit não está a usar a tua chave JSON.")
+            st.info("💡 A biblioteca continua a tentar acesso público. Verifica se tens um ficheiro '.streamlit/secrets.toml' no GitHub que possa estar a interferir.")
         return False
 
 # Carregamento
@@ -153,7 +162,8 @@ with tabs[0]: # AGENDA
                 if new_d.strftime('%Y-%m-%d') != row['Data']:
                     new_o = pd.DataFrame([{'id': row['Key'], 'date': new_d.strftime('%Y-%m-%d')}])
                     df_overrides = pd.concat([df_overrides[df_overrides.id != row['Key']], new_o], ignore_index=True)
-                    save_to_sheets(df_sessions, df_overrides); st.rerun()
+                    save_to_sheets(df_sessions, df_overrides)
+                    st.rerun()
                 if st.button("Iniciar Estudo", key=f"b_{row['Key']}"):
                     st.session_state.prefill = row; st.success("Copiado! Vai a 'Registrar'.")
     else: st.write("Nada pendente.")
@@ -171,12 +181,15 @@ with tabs[1]: # REGISTRAR
         with c3: t_in = st.number_input("Total Questões", min_value=1, value=20)
         with c4: ac_in = st.number_input("Acertos", min_value=0, value=0)
         err_in = st.text_area("IDs das Questões Erradas")
-        if st.form_submit_button("Salvar"):
+        if st.form_submit_button("Salvar Registro"):
             new_r = pd.DataFrame([{'data': d_in.strftime('%Y-%m-%d'), 'materia': m_in, 'assunto': a_in, 'total': int(t_in), 'acertos': int(ac_in), 'timestamp': datetime.now().timestamp(), 'erros': err_in}])
             df_sessions = pd.concat([df_sessions, new_r], ignore_index=True)
             key = f"{m_in}-{a_in}".lower().replace(" ", "").replace("/", "-")
-            if save_to_sheets(df_sessions, df_overrides[df_overrides.id != key]):
-                st.session_state.prefill = None; st.rerun()
+            # Remove override antigo ao salvar nova sessão
+            new_overrides = df_overrides[df_overrides.id != key]
+            if save_to_sheets(df_sessions, new_overrides):
+                st.session_state.prefill = None
+                st.rerun()
 
 with tabs[2]: # DESEMPENHO
     if not df_sessions.empty:
@@ -194,4 +207,5 @@ with tabs[3]: # HISTÓRICO
             idx = st.number_input("Índice", min_value=0, max_value=len(df_sessions)-1, step=1)
             if st.button("Confirmar Exclusão"):
                 df_sessions = df_sessions.drop(df_sessions.index[idx])
-                save_to_sheets(df_sessions, df_overrides); st.rerun()
+                save_to_sheets(df_sessions, df_overrides)
+                st.rerun()
